@@ -64,7 +64,7 @@ fn execCommand(allocator: Allocator, command: [:0]const u8, cwd: ?[]const u8) ![
 
     var child = std.process.Child.init(&argv, allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
     if (cwd) |dir| child.cwd = dir;
 
     try child.spawn();
@@ -79,52 +79,21 @@ fn execCommand(allocator: Allocator, command: [:0]const u8, cwd: ?[]const u8) ![
     return allocator.dupe(u8, trimmed);
 }
 
-fn isGitRepo(allocator: Allocator, dir: []const u8) bool {
-    var buf: [256]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const temp_alloc = fba.allocator();
-
-    const cmd = temp_alloc.dupeZ(u8, "git rev-parse --is-inside-work-tree") catch return false;
-    const result = execCommand(allocator, cmd, dir) catch return false;
-    defer allocator.free(result);
-
-    return std.mem.eql(u8, result, "true");
+fn getGitBranch(allocator: Allocator, dir: []const u8) ?[]const u8 {
+    return execCommand(allocator, "git branch --show-current", dir) catch return null;
 }
 
-fn getGitBranch(allocator: Allocator, dir: []const u8) ![]const u8 {
-    var buf: [256]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const temp_alloc = fba.allocator();
-
-    const cmd = try temp_alloc.dupeZ(u8, "git branch --show-current");
-    return execCommand(allocator, cmd, dir) catch try allocator.dupe(u8, "");
-}
-
-fn getDiffStats(allocator: Allocator, dir: []const u8) !DiffStats {
-    var buf: [256]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const temp_alloc = fba.allocator();
-
-    const cmd = try temp_alloc.dupeZ(u8, "git diff --stat");
-    const output = execCommand(allocator, cmd, dir) catch return DiffStats{};
+fn getDiffStats(allocator: Allocator, dir: []const u8) DiffStats {
+    const output = execCommand(allocator, "git diff --stat", dir) catch return DiffStats{};
     defer allocator.free(output);
 
     if (output.len == 0) return DiffStats{};
 
-    var lines = std.mem.splitScalar(u8, output, '\n');
-    var last_line: ?[]const u8 = null;
+    const trimmed = std.mem.trimRight(u8, output, "\n");
+    const last_nl = std.mem.lastIndexOfScalar(u8, trimmed, '\n');
+    const last_line = if (last_nl) |pos| trimmed[pos + 1 ..] else trimmed;
 
-    while (lines.next()) |line| {
-        if (line.len > 0) {
-            last_line = line;
-        }
-    }
-
-    if (last_line) |line| {
-        return parseDiffSummary(line);
-    }
-
-    return DiffStats{};
+    return parseDiffSummary(last_line);
 }
 
 fn parseDiffSummary(line: []const u8) DiffStats {
@@ -136,7 +105,7 @@ fn parseDiffSummary(line: []const u8) DiffStats {
 
     while (tokens.next()) |token| {
         if (prev_token) |prev| {
-            if (std.mem.indexOf(u8, token, "file") != null or std.mem.indexOf(u8, token, "changed") != null) {
+            if (std.mem.indexOf(u8, token, "file") != null) {
                 stats.files = std.fmt.parseUnsigned(u32, prev, 10) catch stats.files;
             } else if (std.mem.indexOf(u8, token, "insertion") != null) {
                 stats.insertions = std.fmt.parseUnsigned(u32, prev, 10) catch stats.insertions;
@@ -167,16 +136,14 @@ pub fn main() !void {
     const stdin = std.fs.File.stdin();
     const input_json = try stdin.readToEndAlloc(allocator, 1024 * 1024);
 
+    var stdout_buf: [32]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    const stdout = &stdout_writer.interface;
+
     const parsed = json.parseFromSlice(StatuslineInput, allocator, input_json, .{
         .ignore_unknown_fields = true,
     }) catch {
-        var stdout_buf: [32]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-        const stdout = &stdout_writer.interface;
-        stdout.writeAll(colors.cyan) catch {};
-        stdout.writeAll("~") catch {};
-        stdout.writeAll(colors.reset) catch {};
-        stdout.writeAll("\n") catch {};
+        stdout.writeAll(colors.cyan ++ "~" ++ colors.reset ++ "\n") catch {};
         stdout.flush() catch {};
         return;
     };
@@ -189,20 +156,14 @@ pub fn main() !void {
 
     const current_dir = if (input.workspace) |ws| ws.current_dir else null;
 
-    if (current_dir == null) {
-        try writer.print("{s}~{s}", .{ colors.cyan, colors.reset });
-    } else {
-        const dir = current_dir.?;
+    if (current_dir) |dir| {
+        try writer.print("{s}", .{colors.yellow});
+        try formatPath(writer, dir);
+        try writer.print("{s}", .{colors.reset});
 
-        if (isGitRepo(allocator, dir)) {
-            const branch = try getGitBranch(allocator, dir);
+        if (getGitBranch(allocator, dir)) |branch| {
             defer allocator.free(branch);
-
-            const diff_stats = try getDiffStats(allocator, dir);
-
-            try writer.print("{s}", .{colors.yellow});
-            try formatPath(writer, dir);
-            try writer.print("{s}", .{colors.reset});
+            const diff_stats = getDiffStats(allocator, dir);
 
             try writer.print(" {s}•{s} {s}[{s}{s}{s}]{s}", .{
                 colors.gray,
@@ -215,19 +176,12 @@ pub fn main() !void {
             });
 
             try diff_stats.format(writer);
-        } else {
-            try writer.print("{s}", .{colors.yellow});
-            try formatPath(writer, dir);
-            try writer.print("{s}", .{colors.reset});
         }
+    } else {
+        try writer.print("{s}~{s}", .{ colors.cyan, colors.reset });
     }
 
-    const output = output_stream.getWritten();
-
-    var stdout_buf: [32]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
-    stdout.writeAll(output) catch {};
+    stdout.writeAll(output_stream.getWritten()) catch {};
     stdout.writeAll("\n") catch {};
     stdout.flush() catch {};
 }
