@@ -1,4 +1,4 @@
-// Simple statusline: [<branch>] • <cwd> • <git diff --stat>
+// Simple statusline: <cwd> • [<branch>] • <git diff --stat>
 // Compile with: zig build-exe statusline.zig -O ReleaseFast -fsingle-threaded
 
 const std = @import("std");
@@ -200,20 +200,19 @@ pub fn main() !void {
 
             const diff_stats = try getDiffStats(allocator, dir);
 
-            try writer.print("{s}[{s}{s}{s}]{s} {s}•{s} {s}", .{
+            try writer.print("{s}", .{colors.yellow});
+            try formatPath(writer, dir);
+            try writer.print("{s}", .{colors.reset});
+
+            try writer.print(" {s}•{s} {s}[{s}{s}{s}]{s}", .{
                 colors.gray,
                 colors.reset,
+                colors.gray,
                 colors.blue,
                 branch,
                 colors.gray,
                 colors.reset,
-                colors.gray,
-                colors.reset,
             });
-
-            try writer.print("{s}", .{colors.yellow});
-            try formatPath(writer, dir);
-            try writer.print("{s}", .{colors.reset});
 
             try diff_stats.format(writer);
         } else {
