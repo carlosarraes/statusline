@@ -5,7 +5,7 @@ A simple terminal statusline that shows the current directory, git branch, and d
 ## Build
 
 ```sh
-zig build-exe statusline.zig -O ReleaseFast -fsingle-threaded
+zig build-exe statusline.zig -O ReleaseFast
 ```
 
 ## Usage
