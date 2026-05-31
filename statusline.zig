@@ -12,14 +12,33 @@ const colors = struct {
     const red = "\x1b[31m";
     const yellow = "\x1b[33m";
     const blue = "\x1b[34m";
+    const magenta = "\x1b[35m";
     const reset = "\x1b[0m";
 };
 
 const StatuslineInput = struct {
     workspace: ?struct {
-        current_dir: ?[]const u8,
+        current_dir: ?[]const u8 = null,
+        git_worktree: ?[]const u8 = null,
     } = null,
     cwd: ?[]const u8 = null,
+    context_window: ?struct {
+        used_percentage: ?f64 = null,
+    } = null,
+};
+
+// Input for the subagent panel: a different shape (a list of tasks) on the
+// same stdin, selected with the `--subagent` flag.
+const SubagentInput = struct {
+    tasks: []const Task = &.{},
+
+    const Task = struct {
+        id: []const u8 = "",
+        name: ?[]const u8 = null,
+        status: ?[]const u8 = null,
+        tokenCount: ?f64 = null,
+        cwd: ?[]const u8 = null,
+    };
 };
 
 const DiffStats = struct {
@@ -168,6 +187,101 @@ fn writeStdout(bytes: []const u8) !void {
     }
 }
 
+const context_bar_width = 10;
+
+fn contextColor(pct: u8) []const u8 {
+    if (pct >= 90) return colors.red;
+    if (pct >= 70) return colors.yellow;
+    return colors.green;
+}
+
+fn formatContext(writer: *std.Io.Writer, used_percentage: f64) !void {
+    const clamped = std.math.clamp(used_percentage, 0.0, 100.0);
+    const pct: u8 = @intFromFloat(clamped);
+    const filled = pct / (100 / context_bar_width);
+    const color = contextColor(pct);
+
+    try writer.print(" {s}•{s} {s}", .{ colors.gray, colors.reset, color });
+    var i: u8 = 0;
+    while (i < context_bar_width) : (i += 1) {
+        try writer.writeAll(if (i < filled) "▓" else "░");
+    }
+    try writer.print(" {d}%{s}", .{ pct, colors.reset });
+}
+
+fn formatTokens(writer: *std.Io.Writer, count: u64) !void {
+    if (count < 1000) {
+        try writer.print("{d}", .{count});
+    } else if (count < 1_000_000) {
+        try writer.print("{d}.{d}k", .{ count / 1000, (count % 1000) / 100 });
+    } else {
+        try writer.print("{d}.{d}m", .{ count / 1_000_000, (count % 1_000_000) / 100_000 });
+    }
+}
+
+fn statusColor(status: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, status, "error") != null or
+        std.mem.indexOf(u8, status, "fail") != null) return colors.red;
+    if (std.mem.indexOf(u8, status, "pending") != null or
+        std.mem.indexOf(u8, status, "queue") != null) return colors.yellow;
+    if (std.mem.indexOf(u8, status, "run") != null or
+        std.mem.indexOf(u8, status, "active") != null or
+        std.mem.indexOf(u8, status, "progress") != null) return colors.green;
+    return colors.gray;
+}
+
+// Minimal JSON string encoder: escapes the bytes our content can contain.
+// The ANSI escape byte 0x1b is a JSON control char and is unicode-escaped.
+fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0c => try writer.writeAll("\\f"),
+            else => if (c < 0x20)
+                try writer.print("\\u{x:0>4}", .{c})
+            else
+                try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn formatSubagentRow(writer: *std.Io.Writer, task: SubagentInput.Task) !void {
+    try writer.print("{s}{s}{s}", .{ colors.cyan, task.name orelse "agent", colors.reset });
+
+    if (task.status) |st| {
+        try writer.print(" {s}·{s} {s}{s}{s}", .{ colors.gray, colors.reset, statusColor(st), st, colors.reset });
+    }
+
+    if (task.tokenCount) |tc| {
+        try writer.print(" {s}·{s} {s}", .{ colors.gray, colors.reset, colors.gray });
+        try formatTokens(writer, @intFromFloat(@round(tc)));
+        try writer.writeAll(colors.reset);
+    }
+
+    if (task.cwd) |cwd| {
+        const base = std.fs.path.basename(cwd);
+        if (base.len > 0) {
+            try writer.print(" {s}·{s} {s}{s}{s}", .{ colors.gray, colors.reset, colors.blue, base, colors.reset });
+        }
+    }
+}
+
+fn isSubagentMode(init: std.process.Init) bool {
+    var it = init.minimal.args.iterate();
+    _ = it.skip(); // program name
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--subagent")) return true;
+    }
+    return false;
+}
+
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -175,6 +289,43 @@ pub fn main(init: std.process.Init) !void {
 
     const input_json = try readStdinAlloc(allocator, 1024 * 1024);
 
+    if (isSubagentMode(init)) {
+        runSubagent(allocator, input_json);
+        return;
+    }
+
+    try runStatusline(allocator, init, input_json);
+}
+
+// Emits one JSON line per subagent row to override its panel rendering.
+// Any per-row failure is skipped, leaving that row's default display intact.
+fn runSubagent(allocator: Allocator, input_json: []const u8) void {
+    const parsed = json.parseFromSlice(SubagentInput, allocator, input_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return;
+
+    for (parsed.value.tasks) |task| {
+        if (task.id.len == 0) continue;
+
+        var content_buf: [512]u8 = undefined;
+        var content_writer: std.Io.Writer = .fixed(&content_buf);
+        formatSubagentRow(&content_writer, task) catch continue;
+
+        var row_buf: [1024]u8 = undefined;
+        var row_writer: std.Io.Writer = .fixed(&row_buf);
+        const ok = blk: {
+            row_writer.writeAll("{\"id\":") catch break :blk false;
+            writeJsonString(&row_writer, task.id) catch break :blk false;
+            row_writer.writeAll(",\"content\":") catch break :blk false;
+            writeJsonString(&row_writer, content_writer.buffered()) catch break :blk false;
+            row_writer.writeAll("}\n") catch break :blk false;
+            break :blk true;
+        };
+        if (ok) writeStdout(row_writer.buffered()) catch {};
+    }
+}
+
+fn runStatusline(allocator: Allocator, init: std.process.Init, input_json: []const u8) !void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     const stdout = &stdout_writer;
@@ -189,7 +340,7 @@ pub fn main(init: std.process.Init) !void {
 
     const input = parsed.value;
 
-    var output_buf: [1024]u8 = undefined;
+    var output_buf: [2048]u8 = undefined;
     var output_writer: std.Io.Writer = .fixed(&output_buf);
     const writer = &output_writer;
 
@@ -200,10 +351,16 @@ pub fn main(init: std.process.Init) !void {
         break :blk try allocator.dupe(u8, try getCwd(&cwd_buf));
     } else null;
 
+    const in_worktree = if (input.workspace) |ws| ws.git_worktree != null else false;
+
     if (current_dir) |dir| {
         try writer.print("{s}", .{colors.yellow});
         try formatPath(writer, dir, init.environ_map.get("HOME") orelse "");
         try writer.print("{s}", .{colors.reset});
+
+        if (in_worktree) {
+            try writer.print(" {s}•{s} {s}⑂{s}", .{ colors.gray, colors.reset, colors.magenta, colors.reset });
+        }
 
         if (getGitBranch(allocator, init.io, dir)) |branch| {
             defer allocator.free(branch);
@@ -223,6 +380,12 @@ pub fn main(init: std.process.Init) !void {
         }
     } else {
         try writer.print("{s}~{s}", .{ colors.cyan, colors.reset });
+    }
+
+    if (input.context_window) |cw| {
+        if (cw.used_percentage) |pct| {
+            try formatContext(writer, pct);
+        }
     }
 
     stdout.writeAll(output_writer.buffered()) catch {};
@@ -272,4 +435,46 @@ test "parseDiffSummary only deletions" {
     try std.testing.expectEqual(@as(u32, 2), stats.files);
     try std.testing.expectEqual(@as(u32, 0), stats.insertions);
     try std.testing.expectEqual(@as(u32, 10), stats.deletions);
+}
+
+test "formatContext low usage renders a green bar" {
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try formatContext(&writer, 22);
+
+    const expected = " \x1b[90m•\x1b[0m \x1b[32m▓▓░░░░░░░░ 22%\x1b[0m";
+    try std.testing.expectEqualStrings(expected, writer.buffered());
+}
+
+test "formatContext high usage renders a red bar" {
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try formatContext(&writer, 95);
+
+    const expected = " \x1b[90m•\x1b[0m \x1b[31m▓▓▓▓▓▓▓▓▓░ 95%\x1b[0m";
+    try std.testing.expectEqualStrings(expected, writer.buffered());
+}
+
+test "formatTokens humanizes counts" {
+    const cases = .{
+        .{ @as(u64, 0), "0" },
+        .{ @as(u64, 999), "999" },
+        .{ @as(u64, 1000), "1.0k" },
+        .{ @as(u64, 12300), "12.3k" },
+        .{ @as(u64, 1_500_000), "1.5m" },
+    };
+    inline for (cases) |case| {
+        var buf: [32]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try formatTokens(&writer, case[0]);
+        try std.testing.expectEqualStrings(case[1], writer.buffered());
+    }
+}
+
+test "writeJsonString escapes the ansi escape byte" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writeJsonString(&writer, "\x1b[32mok\x1b[0m");
+
+    try std.testing.expectEqualStrings("\"\\u001b[32mok\\u001b[0m\"", writer.buffered());
 }
