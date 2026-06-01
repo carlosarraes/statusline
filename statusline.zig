@@ -162,13 +162,9 @@ fn readStdinAlloc(allocator: Allocator, max_bytes: usize) ![]u8 {
     return list.toOwnedSlice(allocator);
 }
 
-fn getCwd(buffer: []u8) ![]u8 {
-    const rc = std.posix.system.getcwd(buffer.ptr, buffer.len);
-    return switch (std.posix.errno(rc)) {
-        .SUCCESS => buffer[0 .. @as(usize, @intCast(rc)) - 1],
-        .RANGE => error.NameTooLong,
-        else => error.Unexpected,
-    };
+fn getCwd(io: std.Io, buffer: []u8) ![]u8 {
+    const len = try std.process.currentPath(io, buffer);
+    return buffer[0..len];
 }
 
 fn writeStdout(bytes: []const u8) !void {
@@ -348,7 +344,7 @@ fn runStatusline(allocator: Allocator, init: std.process.Init, input_json: []con
     const current_dir = if (input_dir) |dir| blk: {
         if (std.fs.path.isAbsolute(dir)) break :blk dir;
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        break :blk try allocator.dupe(u8, try getCwd(&cwd_buf));
+        break :blk try allocator.dupe(u8, try getCwd(init.io, &cwd_buf));
     } else null;
 
     const in_worktree = if (input.workspace) |ws| ws.git_worktree != null else false;
