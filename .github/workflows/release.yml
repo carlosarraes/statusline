@@ -1,0 +1,37 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Run tests
+        run: zig test statusline.zig
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          build() { zig build-exe statusline.zig -O ReleaseFast -fstrip -femit-bin="dist/$2" -target "$1"; }
+          build x86_64-linux-musl  statusline-linux-x86_64
+          build aarch64-linux-musl statusline-linux-arm64
+          build x86_64-macos       statusline-macos-x86_64
+          build aarch64-macos      statusline-macos-arm64
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes dist/*
